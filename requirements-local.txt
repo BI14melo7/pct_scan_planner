@@ -1,0 +1,8 @@
+cupy-cuda12x==14.2.0
+numpy==2.2.6
+open3d==0.20.0
+packaging==26.3
+pybind11==3.1.0
+scipy==1.15.3
+setuptools==79.0.1
+cffi==2.1.1
