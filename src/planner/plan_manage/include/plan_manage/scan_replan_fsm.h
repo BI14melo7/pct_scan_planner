@@ -3,6 +3,7 @@
 
 #include <Eigen/Eigen>
 #include <algorithm>
+#include <chrono>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <iostream>
 #include <nav_msgs/msg/odometry.hpp>
@@ -52,7 +53,7 @@ namespace scan_planner
 
     /* parameters */
     int navi_mode_; // 1 manual select, 2 hard code
-    double no_replan_thresh_, replan_thresh_;
+    double no_replan_thresh_, replan_thresh_, goal_tolerance_;
     std::vector<Eigen::Vector3d> preset_waypoints_;
     int waypoint_num_;
     double planning_horizon_;
@@ -61,6 +62,10 @@ namespace scan_planner
     double self_inflation_z_up_, self_inflation_z_down_;
     double self_double_cylinder_radius_, self_double_cylinder_offset_;
     double body_height_;
+    double rejected_target_radius_;
+    double local_target_clearance_;
+    double rolling_corner_stop_angle_;
+    double replan_failure_grace_;
     std::string self_inflation_frame_id_;
 
     /* planning data */
@@ -72,7 +77,9 @@ namespace scan_planner
     FSM_EXEC_STATE exec_state_;
     int continuously_called_times_{0};
     int replan_fail_count_{0};
-    int max_replan_fail_count_{1000};
+    int max_replan_fail_count_{20};
+    bool replan_failure_active_{false};
+    std::chrono::steady_clock::time_point replan_failure_start_;
     rclcpp::Time last_freeze_update_time_;
 
     Eigen::Vector3d odom_pos_, odom_vel_, odom_acc_; // odometry state
@@ -82,6 +89,7 @@ namespace scan_planner
     Eigen::Vector3d end_pt_, end_vel_;                                       // goal state
     Eigen::Vector3d local_target_pt_, local_target_vel_;                     // local target state
     std::vector<Eigen::Vector3d> active_waypoints_;
+    std::vector<Eigen::Vector3d> rejected_targets_;
     int current_wp_;
 
     bool flag_escape_emergency_;
@@ -112,9 +120,15 @@ namespace scan_planner
     bool planGlobalTrajByWaypoints(const std::vector<Eigen::Vector3d> &waypoints);
     bool planNextWaypoint();
     bool isWaypointSequenceMode() const;
-    bool adjustGlobalTargetIfOccupied();
-    void getLocalTarget();
+    bool isPreviouslyRejectedTarget(const Eigen::Vector3d &target) const;
+    void rememberRejectedTarget(const Eigen::Vector3d &target);
+    bool validateGlobalTarget();
+    bool isTargetKnownOccupied(const Eigen::Vector3d &target) const;
+    void cancelActiveTarget(bool emergency_stop, const char *reason);
+    bool getLocalTarget();
     void finishProcess();
+    void noteReplanFailure();
+    void clearReplanFailures();
     void publishSelfInflationMarker();
     double getOdomYaw() const;
     double estimateYawFromSegment(const Eigen::Vector3d &from, const Eigen::Vector3d &to) const;

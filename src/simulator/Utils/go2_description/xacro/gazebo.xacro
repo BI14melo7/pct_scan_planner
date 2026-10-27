@@ -21,6 +21,22 @@
               name="gz_ros2_control::GazeboSimROS2ControlPlugin">
         <parameters>$(find go2_description)/config/ros2_controllers.yaml</parameters>
       </plugin>
+
+      <!--
+        SCAN 输出平面速度指令。Fortress 的 VelocityControl 将该指令作用到
+        Go2 模型，OdometryPublisher 再把 Gazebo 中的真实位姿反馈给规划器。
+      -->
+      <plugin filename="ignition-gazebo-velocity-control-system"
+              name="gz::sim::systems::VelocityControl"/>
+      <plugin filename="ignition-gazebo-odometry-publisher-system"
+              name="gz::sim::systems::OdometryPublisher">
+        <dimensions>3</dimensions>
+        <odom_frame>world</odom_frame>
+        <robot_base_frame>base</robot_base_frame>
+        <odom_topic>/model/go2/odometry</odom_topic>
+        <tf_topic>/model/go2/tf</tf_topic>
+        <odom_publish_frequency>50</odom_publish_frequency>
+      </plugin>
     </gazebo>
 
     <gazebo reference="imu_link">

@@ -76,7 +76,10 @@ namespace scan_planner
     int same_occ_state_times = ENOUGH_INTERVAL + 1;
     bool occ, last_occ = false;
     bool flag_got_start = false, flag_got_end = false, flag_got_end_maybe = false;
-    int i_end = (int)init_points.cols() - order_ - ((int)init_points.cols() - 2 * order_) / 3; // only check closed 2/3 points.
+    // Check the complete executable span.  Deferring the last third to a
+    // future replan allowed a colliding suffix to be published and executed
+    // when replanning failed near a long obstacle.
+    int i_end = (int)init_points.cols() - order_;
     for (int i = order_; i <= i_end; ++i)
     {
       for (double a = 1.0; a >= 0.0; a -= step_size)
@@ -724,7 +727,7 @@ namespace scan_planner
     int in_id, out_id;
     vector<std::pair<int, int>> segment_ids;
     bool flag_new_obs_valid = false;
-    int i_end = end_idx - (end_idx - order_) / 3;
+    int i_end = end_idx;
     for (int i = order_ - 1; i <= i_end; ++i)
     {
 
@@ -1014,11 +1017,15 @@ namespace scan_planner
         UniformBspline traj = UniformBspline(cps_.points, 3, bspline_interval_);
         double tm, tmp;
         traj.getTimeSpan(tm, tmp);
-        double t_step = (tmp - tm) / ((traj.evaluateDeBoorT(tmp) - traj.evaluateDeBoorT(tm)).norm() / grid_map_->getResolution());
-        for (double t = tm; t < tmp * 2 / 3; t += t_step) // Only check the closest 2/3 partition of the whole trajectory.
+        const double chord_length = (traj.evaluateDeBoorT(tmp) - traj.evaluateDeBoorT(tm)).norm();
+        const double t_step = chord_length > 1e-6
+                                  ? std::max(1e-3, (tmp - tm) * grid_map_->getResolution() / chord_length)
+                                  : std::max(1e-3, tmp - tm);
+        for (double t = tm; t <= tmp + 1e-6; t += t_step)
         {
-          Eigen::Vector3d pos = traj.evaluateDeBoorT(t);
-          Eigen::Vector3d pos_next = traj.evaluateDeBoorT(std::min(t + t_step, tmp));
+          const double tc = std::min(t, tmp);
+          Eigen::Vector3d pos = traj.evaluateDeBoorT(tc);
+          Eigen::Vector3d pos_next = traj.evaluateDeBoorT(std::min(tc + t_step, tmp));
           flag_occ = grid_map_->getInflateOccupancy(pos, estimateSegmentYaw(pos, pos_next));
           if (flag_occ)
           {
@@ -1112,11 +1119,15 @@ namespace scan_planner
       UniformBspline traj = UniformBspline(cps_.points, 3, bspline_interval_);
       double tm, tmp;
       traj.getTimeSpan(tm, tmp);
-      double t_step = (tmp - tm) / ((traj.evaluateDeBoorT(tmp) - traj.evaluateDeBoorT(tm)).norm() / grid_map_->getResolution()); // Step size is defined as the maximum size that can passes through every grid.
-      for (double t = tm; t < tmp * 2 / 3; t += t_step)
+      const double chord_length = (traj.evaluateDeBoorT(tmp) - traj.evaluateDeBoorT(tm)).norm();
+      const double t_step = chord_length > 1e-6
+                                ? std::max(1e-3, (tmp - tm) * grid_map_->getResolution() / chord_length)
+                                : std::max(1e-3, tmp - tm);
+      for (double t = tm; t <= tmp + 1e-6; t += t_step)
       {
-        Eigen::Vector3d pos = traj.evaluateDeBoorT(t);
-        Eigen::Vector3d pos_next = traj.evaluateDeBoorT(std::min(t + t_step, tmp));
+        const double tc = std::min(t, tmp);
+        Eigen::Vector3d pos = traj.evaluateDeBoorT(tc);
+        Eigen::Vector3d pos_next = traj.evaluateDeBoorT(std::min(tc + t_step, tmp));
         if (grid_map_->getInflateOccupancy(pos, estimateSegmentYaw(pos, pos_next)))
         {
           // cout << "Refined traj hit_obs, t=" << t << " P=" << traj.evaluateDeBoorT(t).transpose() << endl;

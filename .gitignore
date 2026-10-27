@@ -5,6 +5,7 @@
 /devel/
 /.colcon/
 /compile_commands.json
+/.deps/
 
 # ROS runtime state
 /.ros/

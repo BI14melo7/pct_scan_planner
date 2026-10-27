@@ -20,6 +20,7 @@ def _setup(context):
     use_pcd_map = _as_bool(LaunchConfiguration("use_pcd_map").perform(context))
     use_gpu = _as_bool(LaunchConfiguration("use_gpu").perform(context))
     use_sim_time = _as_bool(LaunchConfiguration("use_sim_time").perform(context))
+    external_map = _as_bool(LaunchConfiguration("external_map").perform(context))
     pcd_map_file = LaunchConfiguration("pcd_map_file").perform(context)
     sensor_type = LaunchConfiguration("sensor_type").perform(context)
     map_x = float(LaunchConfiguration("map_size_x").perform(context))
@@ -35,7 +36,11 @@ def _setup(context):
     simulator_yaml = os.path.join(scan_share, "config", "simulator.yaml")
     nodes = []
 
-    if use_pcd_map:
+    if external_map:
+        # A separate node publishes /map_generator/global_cloud.  This is used
+        # by the Gazebo navigation launch so the point cloud matches its SDF.
+        pass
+    elif use_pcd_map:
         nodes.append(
             Node(
                 package="map_generator",
@@ -137,6 +142,7 @@ def generate_launch_description():
             DeclareLaunchArgument("map_size_y", default_value="40.0"),
             DeclareLaunchArgument("map_size_z", default_value="5.0"),
             DeclareLaunchArgument("use_sim_time", default_value="false"),
+            DeclareLaunchArgument("external_map", default_value="false"),
             OpaqueFunction(function=_setup),
         ]
     )

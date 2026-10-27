@@ -3,12 +3,33 @@ scan_planner_node:
     use_sim_time: false
 
     fsm.navi_mode: 1
-    fsm.thresh_replan: 1.0
+    # Refresh the 3.5 m rolling route after 1.5 m of progress. This leaves
+    # ample obstacle lookahead while avoiding a new trajectory every ~1.3 s.
+    fsm.thresh_replan: 1.5
     fsm.thresh_no_replan: 0.1
-    fsm.planning_horizon: 7.5
+    # Finish the validated terminal trajectory instead of requesting tiny
+    # replans after the robot has entered the accepted goal region.
+    fsm.goal_tolerance: 0.5
+    # Keep each local plan comfortably inside the 5 m one-sided map update
+    # range.  A shorter segment avoids asking the optimizer to follow a long
+    # global-path section through several obstacles at once.
+    fsm.planning_horizon: 3.5
     fsm.emergency_time: 1.0
     fsm.fail_safe: true
-    fsm.max_replan_fail_count: 1000
+    # Reject an occupied/unreachable target instead of retrying it indefinitely.
+    fsm.max_replan_fail_count: 20
+    # Planner callbacks can retry at 100 Hz. Keep a free target alive through
+    # brief rolling-route failures instead of canceling it after a few seconds.
+    fsm.replan_failure_grace: 6.0
+    # Remember rejected no-go targets for this process and block nearby repeats.
+    fsm.rejected_target_radius: 0.5
+    # Keep fixed local endpoints away from the inflation boundary. End control
+    # points are not moved by the optimizer, so a binary free/occupied test is
+    # not sufficient here.
+    fsm.local_target_clearance: 0.25
+    # Ordinary A-star corners retain a turn-dependent terminal speed. Only
+    # larger corners stop translation and let the controller align the body.
+    fsm.rolling_corner_stop_angle_deg: 120.0
 
     grid_map.resolution: 0.05
     grid_map.sliding_map_size_x: 10.0
@@ -55,13 +76,28 @@ scan_planner_node:
     manager.max_jerk: 4.0
     manager.control_points_distance: 0.2
     manager.feasibility_tolerance: 0.5
-    manager.planning_horizon: 7.5
+    manager.planning_horizon: 3.5
+    # Keep the A-star detour window independent from the local trajectory
+    # length so the shorter plan can still search around the long center wall.
+    manager.astar_search_extent: 19.0
+    # The rolling global route uses a coarser grid for fast 2-D obstacle
+    # search, then simplifies the result into only the necessary turn points.
+    manager.global_astar_resolution: 0.10
+    # Global A-star turn points become fixed local endpoints, so both layers
+    # must use the same clearance requirement.
+    manager.global_route_clearance: 0.25
+    # Reserve room for controller tracking and yaw error beyond the modeled
+    # two-cylinder robot footprint.
+    manager.execution_clearance: 0.15
+    # If tracking error leaves the robot inside that margin but outside the
+    # actual obstacle footprint, let it move away and regain the full margin.
+    manager.clearance_recovery_distance: 0.6
 
     optimization.lambda_smooth: 1.0
-    optimization.lambda_collision: 1.0
+    optimization.lambda_collision: 2.0
     optimization.lambda_feasibility: 0.1
     optimization.lambda_fitness: 1.0
-    optimization.dist0: 0.2
+    optimization.dist0: 0.3
     optimization.max_vel: 0.75
     optimization.max_acc: 0.5
     optimization.order: 3

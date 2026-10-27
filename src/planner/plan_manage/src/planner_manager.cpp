@@ -1,6 +1,7 @@
 // #include <fstream>
 #include <plan_manage/planner_manager.h>
 #include <chrono>
+#include <limits>
 #include <thread>
 
 namespace scan_planner
@@ -56,11 +57,16 @@ namespace scan_planner
     pp_.max_vel_ = get_double("manager.max_vel", -1.0);
     pp_.max_acc_ = get_double("manager.max_acc", -1.0);
     pp_.max_jerk_ = get_double("manager.max_jerk", -1.0);
-    pp_.vel_tolerance_ = get_double("optimization.vel_tolerance", 1.0);
-    pp_.acc_tolerance_ = get_double("optimization.acc_tolerance", 1.0);
     pp_.feasibility_tolerance_ = get_double("manager.feasibility_tolerance", 0.0);
     pp_.ctrl_pt_dist = get_double("manager.control_points_distance", -1.0);
     pp_.planning_horizon_ = get_double("manager.planning_horizon", 5.0);
+    pp_.execution_clearance_ = std::max(0.0, get_double("manager.execution_clearance", 0.15));
+    pp_.clearance_recovery_distance_ = std::max(
+        0.1, get_double("manager.clearance_recovery_distance", 0.6));
+    global_astar_resolution_ = std::max(
+        0.05, get_double("manager.global_astar_resolution", 0.1));
+    global_route_clearance_ = std::max(
+        pp_.execution_clearance_, get_double("manager.global_route_clearance", 0.25));
 
     local_data_.traj_id_ = 0;
     grid_map_.reset(new GridMap);
@@ -70,7 +76,20 @@ namespace scan_planner
     bspline_optimizer_rebound_->setParam(node_);
     bspline_optimizer_rebound_->setEnvironment(grid_map_);
     bspline_optimizer_rebound_->a_star_.reset(new AStar);
-    bspline_optimizer_rebound_->a_star_->initGridMap(grid_map_, Eigen::Vector3i(100, 100, 100));
+    // Do not tie the A-star detour window to the local trajectory length.  A
+    // short local plan is easier to optimize, while the search still needs a
+    // wide enough window to find a route around long walls.
+    const double astar_search_extent = std::max(
+        5.0, get_double("manager.astar_search_extent", 19.0));
+    const int astar_pool_voxels = std::max(
+        100, static_cast<int>(std::ceil(astar_search_extent / grid_map_->getResolution())));
+    bspline_optimizer_rebound_->a_star_->initGridMap(
+        grid_map_, Eigen::Vector3i(astar_pool_voxels, astar_pool_voxels, astar_pool_voxels),
+        global_route_clearance_);
+    RCLCPP_INFO(node_->get_logger(),
+                "A-star detour window: %.2f m (%d cells), route clearance: %.2f m",
+                astar_pool_voxels * grid_map_->getResolution(), astar_pool_voxels,
+                global_route_clearance_);
 
     visualization_ = vis;
   }
@@ -91,7 +110,10 @@ namespace scan_planner
     cout << "start: " << start_pt.transpose() << ", " << start_vel.transpose() << "\ngoal:" << local_target_pt.transpose() << ", " << local_target_vel.transpose()
          << endl;
 
-    if ((start_pt - local_target_pt).norm() < 0.2)
+    // Clearance recovery can intentionally select the first free A-star cell
+    // only 10--20 cm away.  Treating every such segment as "already at goal"
+    // leaves the robot parked inside the safety margin with no way to exit.
+    if ((start_pt - local_target_pt).norm() < 0.08)
     {
       cout << "Close to goal" << endl;
       continuous_failures_count_++;
@@ -294,7 +316,11 @@ namespace scan_planner
         pos = UniformBspline(optimal_control_points, 3, ts);
     }
 
-    if (!flag_step_2_success || !checkDynamicFeasibility(pos))
+    // The upstream feasibility/refinement stage above is authoritative for
+    // B-spline timing.  Keep the additional hard gate focused on spatial
+    // safety; a second dynamics model here previously rejected valid refined
+    // turns and canceled otherwise collision-free navigation tasks.
+    if (!flag_step_2_success || !checkCollisionFree(pos))
     {
       printf("\033[34mThis refined trajectory is unsafe or dynamically infeasible. Skip publishing it.\n\033[0m");
       continuous_failures_count_++;
@@ -505,37 +531,316 @@ namespace scan_planner
     local_data_.traj_id_ += 1;
   }
 
-  bool SCANPlannerManager::checkDynamicFeasibility(UniformBspline position_traj)
+  bool SCANPlannerManager::planGlobalTrajWithLocalDetour(
+      const Eigen::Vector3d &start_pos, const Eigen::Vector3d &start_vel,
+      const Eigen::Vector3d &start_acc, const Eigen::Vector3d &end_pos,
+      const Eigen::Vector3d &end_vel, const Eigen::Vector3d &end_acc)
   {
-    UniformBspline vel_traj = position_traj.getDerivative();
-    UniformBspline acc_traj = vel_traj.getDerivative();
-    const double duration = position_traj.getTimeSum();
-    const double sample_dt = std::max(0.01, std::min(0.05, duration / 50.0));
-    const double vel_limit = pp_.max_vel_ + pp_.vel_tolerance_;
-    const double acc_limit = pp_.max_acc_ + pp_.acc_tolerance_;
+    global_route_points_.clear();
+    const Eigen::Vector3d to_goal = end_pos - start_pos;
+    const double goal_distance = to_goal.norm();
+    if (goal_distance < 1e-3)
+      return planGlobalTraj(start_pos, start_vel, start_acc, end_pos, end_vel, end_acc);
 
-    for (double t = 0.0; t < duration + 1e-6; t += sample_dt)
+    // The occupancy grid is rolling, so only search the currently observable
+    // part of the global route.  This route is rebuilt at every local replan;
+    // newly observed obstacles therefore become global detour waypoints before
+    // the local optimizer is asked to track them.
+    const double lookahead = std::min(pp_.planning_horizon_, goal_distance);
+    const Eigen::Vector3d local_goal = start_pos + to_goal * (lookahead / goal_distance);
+    const Eigen::Vector3d line_delta = local_goal - start_pos;
+    const double line_length = line_delta.norm();
+    const double line_yaw = std::atan2(line_delta(1), line_delta(0));
+    bool direct_path_blocked = false;
+    const int line_samples = std::max(
+        1, static_cast<int>(std::ceil(line_length / grid_map_->getResolution())));
+    for (int i = 1; i <= line_samples; ++i)
     {
-      const double tc = std::min(t, duration);
-      Eigen::Vector3d vel = vel_traj.evaluateDeBoorT(tc);
-      if (vel.norm() > vel_limit)
+      const Eigen::Vector3d sample =
+          start_pos + line_delta * (static_cast<double>(i) / line_samples);
+      if (grid_map_->getInflateOccupancyWithClearance(
+              sample, line_yaw, global_route_clearance_) != 0)
       {
-        RCLCPP_WARN(node_->get_logger(),
-                    "Dynamic feasibility failed: velocity at t=%.3f is %.3f > %.3f",
-                    tc, vel.norm(), vel_limit);
-        return false;
-      }
-
-      Eigen::Vector3d acc = acc_traj.evaluateDeBoorT(tc);
-      if (acc.norm() > acc_limit)
-      {
-        RCLCPP_WARN(node_->get_logger(),
-                    "Dynamic feasibility failed: acceleration at t=%.3f is %.3f > %.3f",
-                    tc, acc.norm(), acc_limit);
-        return false;
+        direct_path_blocked = true;
+        break;
       }
     }
 
+    if (!direct_path_blocked)
+    {
+      global_route_points_.push_back(start_pos);
+      global_route_points_.push_back(end_pos);
+      return planGlobalTraj(start_pos, start_vel, start_acc, end_pos, end_vel, end_acc);
+    }
+
+    if (!bspline_optimizer_rebound_ || !bspline_optimizer_rebound_->a_star_)
+      return false;
+
+    std::vector<Eigen::Vector3d> astar_path;
+    auto tryAstarGoal = [&](const Eigen::Vector3d &candidate,
+                            bool require_exact_free,
+                            std::vector<Eigen::Vector3d> &path) {
+      const Eigen::Vector3d delta = candidate - start_pos;
+      if (delta.norm() < 0.2)
+        return false;
+
+      if (require_exact_free)
+      {
+        const double yaw = std::atan2(delta(1), delta(0));
+        if (grid_map_->getInflateOccupancyWithClearance(
+                candidate, yaw, global_route_clearance_) != 0)
+          return false;
+      }
+
+      if (bspline_optimizer_rebound_->a_star_->AstarSearch(
+              global_astar_resolution_, start_pos, candidate) != ASTAR_RET::SUCCESS)
+        return false;
+
+      path = bspline_optimizer_rebound_->a_star_->getPath();
+      return path.size() >= 2;
+    };
+
+    bool used_lateral_proxy = false;
+    double proxy_angle_degrees = 0.0;
+    double proxy_radius = line_delta.head<2>().norm();
+    if (!tryAstarGoal(local_goal, false, astar_path))
+    {
+      // A straight rolling endpoint can lie in front of an obstacle corner.
+      // Moving it to the geometrically nearest free cell is not sufficient:
+      // that cell can be a disconnected sliver between two inflated
+      // obstacles. Search reachable goals on progressively wider lateral
+      // arcs instead, while still making progress toward the real target.
+      const Eigen::Vector2d desired_xy = line_delta.head<2>();
+      const double desired_xy_length = desired_xy.norm();
+      const double pi = std::acos(-1.0);
+      const double radius_scales[] = {1.0, 0.8, 0.6};
+      const double angle_degrees[] = {15.0, 30.0, 45.0, 60.0, 75.0};
+      double best_score = std::numeric_limits<double>::infinity();
+
+      if (desired_xy_length > 0.5)
+      {
+        const Eigen::Vector2d forward = desired_xy / desired_xy_length;
+        for (double radius_scale : radius_scales)
+        {
+          bool found_at_radius = false;
+          for (double angle_deg : angle_degrees)
+          {
+            bool found_at_angle = false;
+            for (double sign : {-1.0, 1.0})
+            {
+              const double angle = sign * angle_deg * pi / 180.0;
+              Eigen::Matrix2d rotation;
+              rotation << std::cos(angle), -std::sin(angle),
+                          std::sin(angle),  std::cos(angle);
+
+              Eigen::Vector3d candidate = start_pos;
+              const double radius = desired_xy_length * radius_scale;
+              candidate.head<2>() += rotation * forward * radius;
+              candidate(2) = start_pos(2) +
+                             radius_scale * (local_goal(2) - start_pos(2));
+
+              std::vector<Eigen::Vector3d> candidate_path;
+              if (!tryAstarGoal(candidate, true, candidate_path))
+                continue;
+
+              double path_length = 0.0;
+              for (size_t i = 1; i < candidate_path.size(); ++i)
+                path_length += (candidate_path[i] - candidate_path[i - 1]).norm();
+              const double score = path_length + (end_pos - candidate_path.back()).norm();
+              if (score < best_score)
+              {
+                best_score = score;
+                astar_path = std::move(candidate_path);
+                proxy_angle_degrees = sign * angle_deg;
+                proxy_radius = radius;
+              }
+              found_at_angle = true;
+              found_at_radius = true;
+            }
+
+            // Prefer the smallest heading change with a reachable candidate;
+            // compare both sides at that angle, then stop widening the arc.
+            if (found_at_angle)
+              break;
+          }
+          if (found_at_radius)
+          {
+            used_lateral_proxy = true;
+            break;
+          }
+        }
+      }
+    }
+
+    if (astar_path.size() < 2)
+    {
+      RCLCPP_WARN(node_->get_logger(),
+                  "Rolling global A-star could not find a reachable forward or lateral goal in the %.2f m lookahead",
+                  lookahead);
+      return false;
+    }
+
+    if (used_lateral_proxy)
+      RCLCPP_INFO(node_->get_logger(),
+                  "Straight lookahead goal was unreachable; using a reachable lateral proxy (angle %.0f deg, radius %.2f m)",
+                  proxy_angle_degrees, proxy_radius);
+
+    std::vector<Eigen::Vector3d> raw_path;
+    raw_path.reserve(astar_path.size() + 1);
+    raw_path.push_back(start_pos);
+    for (const auto &point : astar_path)
+    {
+      if ((point - raw_path.back()).norm() > 1e-3)
+        raw_path.push_back(point);
+    }
+
+    // A-star may move an occupied lookahead endpoint to the nearest free
+    // cell.  Keep that actual free endpoint; reconnecting the original point
+    // would put the global route straight back inside the obstacle.
+    const Eigen::Vector3d route_end = raw_path.back();
+
+    std::vector<double> arc_length(raw_path.size(), 0.0);
+    for (size_t i = 1; i < raw_path.size(); ++i)
+      arc_length[i] = arc_length[i - 1] + (raw_path[i] - raw_path[i - 1]).norm();
+
+    const double detour_length = arc_length.back();
+    if (detour_length < 1e-3)
+      return false;
+
+    auto segmentIsFree = [&](const Eigen::Vector3d &from,
+                             const Eigen::Vector3d &to,
+                             bool allow_start_recovery) {
+      const Eigen::Vector3d delta = to - from;
+      const double length = delta.norm();
+      if (length < 1e-6)
+        return true;
+      const double yaw = std::atan2(delta(1), delta(0));
+      const int samples = std::max(
+          1, static_cast<int>(std::ceil(length / grid_map_->getResolution())));
+      for (int i = 1; i <= samples; ++i)
+      {
+        const double ratio = static_cast<double>(i) / samples;
+        double clearance = global_route_clearance_;
+        if (allow_start_recovery)
+        {
+          const double traveled = length * ratio;
+          clearance *= std::min(
+              1.0, traveled / pp_.clearance_recovery_distance_);
+        }
+        if (grid_map_->getInflateOccupancyWithClearance(
+                from + ratio * delta, yaw, clearance) != 0)
+          return false;
+      }
+      return true;
+    };
+
+    // Remove the dense 10 cm A-star staircase.  Feeding every lattice point
+    // into a minimum-snap fit creates oscillatory, even backwards, reference
+    // velocities.  Retain only the farthest line-of-sight turn points.
+    std::vector<Eigen::Vector3d> simplified_path;
+    simplified_path.push_back(raw_path.front());
+    size_t anchor = 0;
+    while (anchor + 1 < raw_path.size())
+    {
+      size_t next = anchor + 1;
+      for (size_t candidate = raw_path.size() - 1; candidate > anchor; --candidate)
+      {
+        if (segmentIsFree(raw_path[anchor], raw_path[candidate], anchor == 0))
+        {
+          next = candidate;
+          break;
+        }
+      }
+      simplified_path.push_back(raw_path[next]);
+      anchor = next;
+    }
+
+    global_route_points_ = simplified_path;
+
+    std::vector<Eigen::Vector3d> waypoints;
+    waypoints.reserve(simplified_path.size());
+    for (size_t i = 1; i < simplified_path.size(); ++i)
+      waypoints.push_back(simplified_path[i]);
+
+    if ((end_pos - route_end).norm() > 1e-3)
+      waypoints.push_back(end_pos);
+
+    RCLCPP_INFO(node_->get_logger(),
+                "Rolling global route: direct %.2f m is blocked, A-star detour %.2f m simplified to %zu segments (%zu interior corners)",
+                line_length, detour_length, simplified_path.size() - 1,
+                simplified_path.size() > 2 ? simplified_path.size() - 2 : 0);
+    return planGlobalTrajWaypoints(
+        start_pos, start_vel, start_acc, waypoints, end_vel, end_acc);
+  }
+
+  bool SCANPlannerManager::checkCollisionFree(UniformBspline position_traj)
+  {
+    const double duration = position_traj.getTimeSum();
+    if (duration <= 0.0)
+      return false;
+
+    // At most half a voxel of nominal travel per sample.  This validates the
+    // complete trajectory that will be published, including its terminal
+    // third (which the upstream receding-horizon implementation skipped).
+    const double speed = std::max(pp_.max_vel_, 0.1);
+    const double sample_dt = std::max(
+        0.005, std::min(0.05, grid_map_->getResolution() / (2.0 * speed)));
+
+    const Eigen::Vector3d start = position_traj.evaluateDeBoorT(0.0);
+    const Eigen::Vector3d start_next = position_traj.evaluateDeBoorT(
+        std::min(sample_dt, duration));
+    const Eigen::Vector2d start_delta = start_next.head<2>() - start.head<2>();
+    const double start_yaw = start_delta.squaredNorm() > 1e-8
+                                 ? std::atan2(start_delta(1), start_delta(0))
+                                 : 0.0;
+    if (grid_map_->getInflateOccupancy(start, start_yaw) != 0)
+    {
+      RCLCPP_WARN(node_->get_logger(),
+                  "Reject trajectory: initial robot footprint is in collision");
+      return false;
+    }
+    const bool recovering_clearance =
+        grid_map_->getInflateOccupancyWithClearance(
+            start, start_yaw, pp_.execution_clearance_) != 0;
+
+    for (double t = 0.0; t <= duration + 1e-6; t += sample_dt)
+    {
+      const double tc = std::min(t, duration);
+      const double prev_t = std::max(tc - sample_dt, 0.0);
+      const double next_t = std::min(tc + sample_dt, duration);
+      const Eigen::Vector3d pos = position_traj.evaluateDeBoorT(tc);
+      const Eigen::Vector3d prev = position_traj.evaluateDeBoorT(prev_t);
+      const Eigen::Vector3d next = position_traj.evaluateDeBoorT(next_t);
+      const Eigen::Vector2d delta = next.head<2>() - prev.head<2>();
+      const double yaw = delta.squaredNorm() > 1e-8
+                             ? std::atan2(delta(1), delta(0))
+                             : 0.0;
+      double required_clearance = pp_.execution_clearance_;
+      if (recovering_clearance && tc < duration - 1e-6)
+      {
+        const double displacement = (pos.head<2>() - start.head<2>()).norm();
+        const double recovery_ratio = std::min(
+            1.0, displacement / pp_.clearance_recovery_distance_);
+        required_clearance *= recovery_ratio;
+      }
+      const int occupancy = grid_map_->getInflateOccupancyWithClearance(
+          pos, yaw, required_clearance);
+      if (occupancy != 0)
+      {
+        RCLCPP_WARN(node_->get_logger(),
+                    "Reject trajectory: sample violates %.2f m required clearance at "
+                    "t=%.3f, p=[%.2f, %.2f, %.2f], occupancy=%d",
+                    required_clearance, tc, pos(0), pos(1), pos(2), occupancy);
+        return false;
+      }
+    }
+    if (recovering_clearance)
+    {
+      RCLCPP_INFO(node_->get_logger(),
+                  "Accepted clearance-recovery trajectory; full %.2f m margin "
+                  "must be regained within %.2f m",
+                  pp_.execution_clearance_, pp_.clearance_recovery_distance_);
+    }
     return true;
   }
 

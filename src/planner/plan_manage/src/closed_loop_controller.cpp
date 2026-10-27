@@ -22,12 +22,20 @@ class ClosedLoopController : public rclcpp::Node
 public:
   ClosedLoopController() : Node("closed_loop_controller")
   {
-    time_forward_ = declare_parameter<double>("time_forward", 0.8);
-    heading_error_threshold_ = declare_parameter<double>("heading_error_threshold", 0.8);
+    time_forward_ = declare_parameter<double>("time_forward", 1.0);
+    heading_lookahead_distance_ =
+        declare_parameter<double>("heading_lookahead_distance", 0.45);
+    heading_error_threshold_ = declare_parameter<double>("heading_error_threshold", 1.05);
+    heading_hold_threshold_ = declare_parameter<double>("heading_hold_threshold", 0.18);
+    large_turn_confirm_time_ =
+        declare_parameter<double>("large_turn_confirm_time", 0.35);
+    side_step_distance_ = declare_parameter<double>("side_step_distance", 1.2);
+    side_step_min_angle_ = declare_parameter<double>("side_step_min_angle", 0.22);
+    side_step_max_angle_ = declare_parameter<double>("side_step_max_angle", 0.65);
     kp_pos_ = declare_parameter<double>("kp_pos", 0.8);
     kp_yaw_ = declare_parameter<double>("kp_yaw", 1.5);
     max_vx_ = declare_parameter<double>("max_vx", 0.75);
-    max_vy_ = declare_parameter<double>("max_vy", 0.35);
+    max_vy_ = declare_parameter<double>("max_vy", 0.25);
     max_vyaw_ = std::min(declare_parameter<double>("max_vyaw", 1.0), kMaxVYawLimit);
     finish_dist_ = declare_parameter<double>("finish_dist", 0.15);
 
@@ -63,8 +71,26 @@ private:
 
   double estimateDesiredYaw(double t_cur, const Eigen::Vector3d &pos_des) const
   {
-    const double t_look = std::min(traj_duration_, t_cur + time_forward_);
-    Eigen::Vector3d direction = traj_[0].evaluateDeBoorT(t_look) - pos_des;
+    // Use a spatial chord instead of the instantaneous B-spline tangent.
+    // Replans can preserve a stale initial derivative for a few centimetres;
+    // following that tangent directly makes the body turn backwards and then
+    // immediately turn forward again.  Looking farther along the same path
+    // ignores that small transient without changing the translation path.
+    Eigen::Vector3d direction = Eigen::Vector3d::Zero();
+    const double t_end = std::min(traj_duration_, t_cur + time_forward_);
+    const double sample_dt = std::max(0.05, std::min(0.15, time_forward_ / 6.0));
+    for (double t = std::min(t_cur + sample_dt, t_end);
+         t <= t_end + 1e-6; t += sample_dt)
+    {
+      const Eigen::Vector3d candidate =
+          traj_[0].evaluateDeBoorT(std::min(t, t_end)) - pos_des;
+      if (candidate.head<2>().squaredNorm() > direction.head<2>().squaredNorm())
+        direction = candidate;
+      if (candidate.head<2>().norm() >= heading_lookahead_distance_)
+        break;
+    }
+    if (direction.head<2>().squaredNorm() < 1e-4)
+      direction = traj_[0].evaluateDeBoorT(traj_duration_) - pos_des;
     if (direction.head<2>().squaredNorm() < 1e-4)
       direction = traj_[1].evaluateDeBoorT(t_cur);
     return direction.head<2>().squaredNorm() < 1e-4
@@ -106,6 +132,38 @@ private:
     exec_time_ = 0.0;
     last_update_time_ = now();
     receive_traj_ = true;
+
+    // A short local detour with a moderate heading change is better handled
+    // as a quadruped side-step.  Larger or longer turns still rotate the body
+    // toward the path.  The 37 degree upper bound also keeps the difference
+    // between the path-aligned and body-aligned collision footprints inside
+    // the planner's existing execution-clearance envelope.  Select the mode
+    // once per trajectory so a tangent near a threshold cannot cause chatter.
+    side_step_active_ = false;
+    if (have_odom_)
+    {
+      const Eigen::Vector3d start_pos = traj_[0].evaluateDeBoorT(0.0);
+      const Eigen::Vector3d terminal_pos = traj_[0].evaluateDeBoorT(traj_duration_);
+      const double terminal_distance =
+          (terminal_pos.head<2>() - odom_pos_.head<2>()).norm();
+      const double initial_yaw_error =
+          normalizeAngle(estimateDesiredYaw(0.0, start_pos) - odom_yaw_);
+      const double abs_initial_yaw_error = std::abs(initial_yaw_error);
+      side_step_active_ =
+          terminal_distance <= side_step_distance_ &&
+          abs_initial_yaw_error >= side_step_min_angle_ &&
+          abs_initial_yaw_error <= side_step_max_angle_;
+      if (side_step_active_)
+        RCLCPP_INFO(get_logger(),
+                    "Short detour %.2f m at %.1f deg: locking lateral side-step for trajectory %lld",
+                    terminal_distance, initial_yaw_error * 180.0 / M_PI,
+                    static_cast<long long>(traj_id_));
+      else if (abs_initial_yaw_error > 2.1)
+        RCLCPP_WARN(get_logger(),
+                    "Trajectory %lld requests a %.1f deg initial turn; waiting for stable heading before turning",
+                    static_cast<long long>(traj_id_),
+                    initial_yaw_error * 180.0 / M_PI);
+    }
     RCLCPP_INFO(get_logger(), "Received trajectory %lld, duration %.3fs",
                 static_cast<long long>(traj_id_), traj_duration_);
   }
@@ -130,15 +188,40 @@ private:
     if (dt < 0.0 || dt > 0.2) dt = 0.0;
     const double t_eval = std::min(exec_time_, traj_duration_);
     Eigen::Vector3d pos_des = traj_[0].evaluateDeBoorT(t_eval);
-    const double yaw_error = normalizeAngle(estimateDesiredYaw(t_eval, pos_des) - odom_yaw_);
+    const double path_yaw_error =
+        normalizeAngle(estimateDesiredYaw(t_eval, pos_des) - odom_yaw_);
+    const double abs_path_yaw_error = std::abs(path_yaw_error);
+
+    // A locked side-step keeps the current body heading for the whole local
+    // trajectory.  Tiny heading errors are ignored in either mode.
+    const bool hold_heading =
+        side_step_active_ || abs_path_yaw_error <= heading_hold_threshold_;
+
+    const double yaw_error = hold_heading ? 0.0 : path_yaw_error;
     const double yaw_command = std::clamp(kp_yaw_ * yaw_error, -max_vyaw_, max_vyaw_);
-    if (std::abs(yaw_error) > heading_error_threshold_)
+    if (!hold_heading && abs_path_yaw_error > heading_error_threshold_)
     {
       publishExecutionFrozen(true);
-      publishStop(yaw_command);
+      const double desired_yaw = normalizeAngle(odom_yaw_ + path_yaw_error);
+      if (!large_turn_pending_ ||
+          std::abs(normalizeAngle(desired_yaw - pending_turn_yaw_)) > 0.35)
+      {
+        large_turn_pending_ = true;
+        pending_turn_yaw_ = desired_yaw;
+        large_turn_pending_since_ = current_time;
+      }
+
+      const double pending_time =
+          (current_time - large_turn_pending_since_).seconds();
+      if (pending_time >= large_turn_confirm_time_)
+        publishStop(yaw_command);
+      else
+        publishStop();
       last_update_time_ = current_time;
       return;
     }
+
+    large_turn_pending_ = false;
 
     publishExecutionFrozen(false);
     exec_time_ = std::min(traj_duration_, exec_time_ + dt);
@@ -151,9 +234,21 @@ private:
         std::max(max_vx_, max_vy_));
     const double c = std::cos(odom_yaw_);
     const double s = std::sin(odom_yaw_);
+    Eigen::Vector2d vel_body(c * vel_world.x() + s * vel_world.y(),
+                            -s * vel_world.x() + c * vel_world.y());
+    // Preserve the requested travel direction when the slower lateral axis
+    // saturates; independent clipping would bend a side-step back toward the
+    // robot's forward axis.
+    double body_scale = 1.0;
+    if (std::abs(vel_body.x()) > max_vx_)
+      body_scale = std::min(body_scale, max_vx_ / std::abs(vel_body.x()));
+    if (std::abs(vel_body.y()) > max_vy_)
+      body_scale = std::min(body_scale, max_vy_ / std::abs(vel_body.y()));
+    vel_body *= body_scale;
+
     geometry_msgs::msg::Twist command;
-    command.linear.x = std::clamp(c * vel_world.x() + s * vel_world.y(), -max_vx_, max_vx_);
-    command.linear.y = std::clamp(-s * vel_world.x() + c * vel_world.y(), -max_vy_, max_vy_);
+    command.linear.x = std::clamp(vel_body.x(), -max_vx_, max_vx_);
+    command.linear.y = std::clamp(vel_body.y(), -max_vy_, max_vy_);
     command.angular.z = yaw_command;
     if (exec_time_ >= traj_duration_ && pos_error.norm() < finish_dist_)
       command = geometry_msgs::msg::Twist();
@@ -167,6 +262,8 @@ private:
   rclcpp::TimerBase::SharedPtr cmd_timer_;
   bool receive_traj_{false};
   bool have_odom_{false};
+  bool side_step_active_{false};
+  bool large_turn_pending_{false};
   std::vector<UniformBspline> traj_;
   double traj_duration_{0.0};
   std::int64_t traj_id_{0};
@@ -174,7 +271,13 @@ private:
   double odom_yaw_{0.0};
   double exec_time_{0.0};
   rclcpp::Time last_update_time_{0, 0, RCL_ROS_TIME};
-  double time_forward_, heading_error_threshold_, kp_pos_, kp_yaw_;
+  rclcpp::Time large_turn_pending_since_{0, 0, RCL_ROS_TIME};
+  double time_forward_, heading_lookahead_distance_;
+  double heading_error_threshold_, heading_hold_threshold_;
+  double large_turn_confirm_time_;
+  double pending_turn_yaw_{0.0};
+  double side_step_distance_, side_step_min_angle_, side_step_max_angle_;
+  double kp_pos_, kp_yaw_;
   double max_vx_, max_vy_, max_vyaw_, finish_dist_;
 };
 }  // namespace scan_planner

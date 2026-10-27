@@ -31,6 +31,10 @@ namespace scan_planner
     bool EmergencyStop(Eigen::Vector3d stop_pos);
     bool planGlobalTraj(const Eigen::Vector3d &start_pos, const Eigen::Vector3d &start_vel, const Eigen::Vector3d &start_acc,
                         const Eigen::Vector3d &end_pos, const Eigen::Vector3d &end_vel, const Eigen::Vector3d &end_acc);
+    bool planGlobalTrajWithLocalDetour(
+        const Eigen::Vector3d &start_pos, const Eigen::Vector3d &start_vel,
+        const Eigen::Vector3d &start_acc, const Eigen::Vector3d &end_pos,
+        const Eigen::Vector3d &end_vel, const Eigen::Vector3d &end_acc);
     bool planGlobalTrajWaypoints(const Eigen::Vector3d &start_pos, const Eigen::Vector3d &start_vel, const Eigen::Vector3d &start_acc,
                                  const std::vector<Eigen::Vector3d> &waypoints, const Eigen::Vector3d &end_vel, const Eigen::Vector3d &end_acc);
 
@@ -39,6 +43,10 @@ namespace scan_planner
     PlanParameters pp_;
     LocalTrajData local_data_;
     GlobalTrajData global_data_;
+    // Collision-free prefix of the rolling global route.  Manual and preset
+    // navigation use this polyline directly instead of sampling through a
+    // smoothed polynomial that can cut obstacle corners.
+    std::vector<Eigen::Vector3d> global_route_points_;
     GridMap::Ptr grid_map_;
 
   private:
@@ -48,10 +56,13 @@ namespace scan_planner
 
     BsplineOptimizer::Ptr bspline_optimizer_rebound_;
 
+    double global_astar_resolution_{0.1};
+    double global_route_clearance_{0.25};
+
     int continuous_failures_count_{0};
 
     void updateTrajInfo(const UniformBspline &position_traj, const rclcpp::Time time_now);
-    bool checkDynamicFeasibility(UniformBspline position_traj);
+    bool checkCollisionFree(UniformBspline position_traj);
 
     void reparamBspline(UniformBspline &bspline, vector<Eigen::Vector3d> &start_end_derivative, double ratio, Eigen::MatrixXd &ctrl_pts, double &dt,
                         double &time_inc);

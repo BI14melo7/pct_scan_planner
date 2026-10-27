@@ -285,6 +285,40 @@ Visualization Manager:
       Use Fixed Frame: true
       Use rainbow: true
       Value: true
+    - Alpha: 0.65
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 3
+        Min Value: -1
+        Value: true
+      Axis: Z
+      Channel Name: intensity
+      Class: rviz_default_plugins/PointCloud2
+      Color: 120; 220; 255
+      Color Transformer: FlatColor
+      Decay Time: 0
+      Enabled: true
+      Invert Rainbow: false
+      Max Color: 255; 255; 255
+      Max Intensity: 4096
+      Min Color: 0; 0; 0
+      Min Intensity: 0
+      Name: Super-LIO World Cloud
+      Position Transformer: XYZ
+      Selectable: true
+      Size (Pixels): 2
+      Size (m): 0.029999999329447746
+      Style: Points
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /lio/cloud_world
+      Use Fixed Frame: true
+      Use rainbow: true
+      Value: true
     - Alpha: 1
       Autocompute Intensity Bounds: true
       Autocompute Value Bounds:
@@ -553,13 +587,26 @@ Visualization Manager:
       Value: true
     - Class: rviz_default_plugins/Marker
       Enabled: true
-      Name: Marker
+      Name: Global Path (cyan)
       Namespaces:
         "": true
       Topic:
-        Depth: 5
-        Durability Policy: Volatile
-        Filter size: 10
+        Depth: 20
+        Durability Policy: Transient Local
+        Filter size: 20
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /global_list
+      Value: true
+    - Class: rviz_default_plugins/Marker
+      Enabled: true
+      Name: Local Path (speed color)
+      Namespaces:
+        "": true
+      Topic:
+        Depth: 20
+        Durability Policy: Transient Local
+        Filter size: 20
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /optimal_list

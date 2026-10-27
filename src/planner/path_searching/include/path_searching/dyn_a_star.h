@@ -66,18 +66,28 @@ private:
 
 	//bool (*checkOccupancyPtr)( const Eigen::Vector3d &pos );
 
-	inline int checkOccupancy(const Eigen::Vector3d &pos, const double yaw) { return grid_map_->getInflateOccupancy(pos, yaw); }
+	inline int checkOccupancy(const Eigen::Vector3d &pos, const double yaw)
+	{
+		return grid_map_->getInflateOccupancyWithClearance(pos, yaw, safety_clearance_);
+	}
 
 	std::vector<GridNodePtr> retrievePath(GridNodePtr current);
 
 	double step_size_, inv_step_size_;
+	double safety_clearance_{0.0};
 	Eigen::Vector3d center_;
 	Eigen::Vector3i CENTER_IDX_, POOL_SIZE_;
 	const double tie_breaker_ = 1.0 + 1.0 / 10000;
 
 	std::vector<GridNodePtr> gridPath_;
 
-	GridNodePtr ***GridNodeMap_;
+	// The search follows a 2-D XY lattice and derives exactly one Z index for
+	// each XY cell from the start/end plane.  Keeping a full X*Y*Z node cube
+	// wastes most of the pool and used to force an unsafe 5 m-wide search
+	// window.  A flat XY pool lets callers provide a substantially wider
+	// detour window without a prohibitive memory cost.
+	std::vector<GridNode> grid_node_pool_;
+	inline GridNodePtr gridNodeAt(int x, int y);
 	std::priority_queue<GridNodePtr, std::vector<GridNodePtr>, NodeComparator> openSet_;
 
 	int rounds_{0};
@@ -88,7 +98,8 @@ public:
 	AStar(){};
 	~AStar();
 
-	void initGridMap(GridMap::Ptr occ_map, const Eigen::Vector3i pool_size);
+	void initGridMap(GridMap::Ptr occ_map, const Eigen::Vector3i pool_size,
+	                 double safety_clearance = 0.0);
 
 	ASTAR_RET AstarSearch(const double step_size, Eigen::Vector3d start_pt, Eigen::Vector3d end_pt);
 
@@ -118,5 +129,11 @@ inline bool AStar::Coord2Index(const Eigen::Vector3d &pt, Eigen::Vector3i &idx) 
 
 	return true;
 };
+
+inline GridNodePtr AStar::gridNodeAt(int x, int y)
+{
+	return &grid_node_pool_[static_cast<size_t>(x) * static_cast<size_t>(POOL_SIZE_(1)) +
+	                        static_cast<size_t>(y)];
+}
 
 #endif

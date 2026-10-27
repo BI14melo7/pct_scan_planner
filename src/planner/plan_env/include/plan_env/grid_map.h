@@ -170,6 +170,8 @@ public:
   inline int getOccupancy(Eigen::Vector3d pos);
   inline int getOccupancy(Eigen::Vector3i id);
   inline int getInflateOccupancy(Eigen::Vector3d pos, double yaw);
+  inline int getInflateOccupancyWithClearance(Eigen::Vector3d pos, double yaw,
+                                              double extra_clearance);
 
   inline void boundIndex(Eigen::Vector3i& id);
   inline bool isUnknown(const Eigen::Vector3i& id);
@@ -377,6 +379,38 @@ inline int GridMap::getInflateOccupancy(Eigen::Vector3d pos, double yaw) {
   if (front_occ != 0) return front_occ;
 
   return getInflateOccupancyFromBuffer(rear, md_.occupancy_buffer_inflate_);
+}
+
+inline int GridMap::getInflateOccupancyWithClearance(Eigen::Vector3d pos, double yaw,
+                                                     double extra_clearance) {
+  const int center_occ = getInflateOccupancy(pos, yaw);
+  if (center_occ != 0 || extra_clearance <= 1e-6) return center_occ;
+
+  // The nominal inflated map models the robot footprint.  Sample translated
+  // footprints around the pose to reserve a real execution margin as well.
+  // This also covers the small footprint displacement caused by yaw tracking
+  // error in the closed-loop controller.
+  const double resolution = std::max(mp_.resolution_, 1e-3);
+  const int radius_cells = static_cast<int>(std::ceil(extra_clearance / resolution));
+  const double sample_radius = extra_clearance + 0.5 * resolution;
+  const double sample_radius_sq = sample_radius * sample_radius;
+
+  for (int dx = -radius_cells; dx <= radius_cells; ++dx) {
+    for (int dy = -radius_cells; dy <= radius_cells; ++dy) {
+      if (dx == 0 && dy == 0) continue;
+
+      const double offset_x = dx * resolution;
+      const double offset_y = dy * resolution;
+      if (offset_x * offset_x + offset_y * offset_y > sample_radius_sq) continue;
+
+      Eigen::Vector3d sample = pos;
+      sample(0) += offset_x;
+      sample(1) += offset_y;
+      const int occ = getInflateOccupancy(sample, yaw);
+      if (occ != 0) return occ;
+    }
+  }
+  return 0;
 }
 
 inline int GridMap::getInflateOccupancyFromBuffer(Eigen::Vector3d pos, const std::vector<char>& buffer) {

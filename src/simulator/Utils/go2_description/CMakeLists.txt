@@ -9,4 +9,7 @@ foreach(directory config dae launch meshes urdf xacro worlds)
   endif()
 endforeach()
 
+install(PROGRAMS scripts/nav_map_publisher.py
+  DESTINATION lib/${PROJECT_NAME})
+
 ament_package()

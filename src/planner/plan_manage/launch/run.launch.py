@@ -23,8 +23,19 @@ def _setup(context):
     use_sim_time = _as_bool(LaunchConfiguration("use_sim_time").perform(context))
     sensor_type = LaunchConfiguration("sensor_type").perform(context)
     controller_mode = LaunchConfiguration("controller_mode").perform(context)
+    external_simulator = _as_bool(
+        LaunchConfiguration("external_simulator").perform(context)
+    )
     keypoints_file = LaunchConfiguration("keypoints_file").perform(context)
     navi_mode = int(LaunchConfiguration("navi_mode").perform(context))
+    body_pose_override = LaunchConfiguration("body_pose_topic").perform(context)
+    sensor_pose_override = LaunchConfiguration("sensor_pose_topic").perform(context)
+    cloud_override = LaunchConfiguration("cloud_topic").perform(context)
+    depth_override = LaunchConfiguration("depth_topic").perform(context)
+    cmd_vel_override = LaunchConfiguration("cmd_vel_topic").perform(context)
+    initial_path_topic = LaunchConfiguration("initial_path_topic").perform(context)
+    cloud_is_world_override = LaunchConfiguration("cloud_is_world").perform(context)
+    need_extrinsic_override = LaunchConfiguration("need_extrinsic").perform(context)
     if sensor_type not in ("lidar", "depth"):
         raise RuntimeError("sensor_type must be 'lidar' or 'depth'")
     if controller_mode not in ("open_loop", "closed_loop"):
@@ -58,6 +69,19 @@ def _setup(context):
         need_extrinsic = False
         intrinsics = {}
 
+    # Topic overrides make the planner independent of a particular LIO package.
+    # For example, Super-LIO publishes /lio/* while the original project used
+    # hard-coded /LIO/* topics.
+    body_pose = body_pose_override or body_pose
+    sensor_pose = sensor_pose_override or sensor_pose
+    cloud = cloud_override or cloud
+    depth = depth_override or depth
+    if cloud_is_world_override:
+        cloud_is_world = _as_bool(cloud_is_world_override)
+    if need_extrinsic_override:
+        need_extrinsic = _as_bool(need_extrinsic_override)
+    cmd_vel = cmd_vel_override or ("/cmd_vel" if is_real else "/quad_0/cmd_vel")
+
     common = {"use_sim_time": use_sim_time}
     planner_overrides = {
         **common,
@@ -80,27 +104,28 @@ def _setup(context):
                 ("cloud", cloud),
                 ("depth", depth),
                 ("move_base_simple/goal", "/move_base_simple/goal"),
-                ("initial_path", "/initial_path"),
+                ("initial_path", initial_path_topic),
             ],
         )
     ]
-    actions.append(
-        Node(
-            package="robot_state_publisher",
-            executable="robot_state_publisher",
-            name="go2_robot_state_publisher",
-            output="screen",
-            parameters=[
-                common,
-                {
-                    "robot_description": Command(
-                        ["xacro ", os.path.join(go2_share, "xacro", "robot.xacro"),
-                         " use_gazebo:=false"]
-                    )
-                },
-            ],
+    if not external_simulator:
+        actions.append(
+            Node(
+                package="robot_state_publisher",
+                executable="robot_state_publisher",
+                name="go2_robot_state_publisher",
+                output="screen",
+                parameters=[
+                    common,
+                    {
+                        "robot_description": Command(
+                            ["xacro ", os.path.join(go2_share, "xacro", "robot.xacro"),
+                             " use_gazebo:=false"]
+                        )
+                    },
+                ],
+            )
         )
-    )
 
     if controller_mode == "open_loop":
         actions.append(
@@ -126,11 +151,11 @@ def _setup(context):
                 parameters=[controllers_yaml, common],
                 remappings=[
                     ("body_pose", body_pose),
-                    ("cmd_vel", "/cmd_vel" if is_real else "/quad_0/cmd_vel"),
+                    ("cmd_vel", cmd_vel),
                 ],
             )
         )
-        if not is_real:
+        if not is_real and not external_simulator:
             actions.append(
                 Node(
                     package="scan_planner",
@@ -155,8 +180,9 @@ def _setup(context):
             )
 
     if not is_real:
-        actions.extend(
-            [
+        simulation_actions = []
+        if not external_simulator:
+            simulation_actions.append(
                 Node(
                     package="scan_planner",
                     executable="go2_gait_publisher",
@@ -164,28 +190,31 @@ def _setup(context):
                     output="screen",
                     parameters=[controllers_yaml, common],
                     remappings=[("body_pose", body_pose)],
+                )
+            )
+        simulation_actions.append(
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(
+                    os.path.join(scan_share, "launch", "simulator.launch.py")
                 ),
-                IncludeLaunchDescription(
-                    PythonLaunchDescriptionSource(
-                        os.path.join(scan_share, "launch", "simulator.launch.py")
-                    ),
-                    launch_arguments={
-                        name: LaunchConfiguration(name)
-                        for name in (
-                            "is_real_world",
-                            "sensor_type",
-                            "use_gpu",
-                            "use_pcd_map",
-                            "pcd_map_file",
-                            "map_size_x",
-                            "map_size_y",
-                            "map_size_z",
-                            "use_sim_time",
-                        )
-                    }.items(),
-                ),
-            ]
+                launch_arguments={
+                    name: LaunchConfiguration(name)
+                    for name in (
+                        "is_real_world",
+                        "sensor_type",
+                        "use_gpu",
+                        "use_pcd_map",
+                        "pcd_map_file",
+                        "map_size_x",
+                        "map_size_y",
+                        "map_size_z",
+                        "use_sim_time",
+                        "external_map",
+                    )
+                }.items(),
+            )
         )
+        actions.extend(simulation_actions)
     return actions
 
 
@@ -207,6 +236,16 @@ def generate_launch_description():
             DeclareLaunchArgument("init_y", default_value="1.0"),
             DeclareLaunchArgument("init_z", default_value="0.3"),
             DeclareLaunchArgument("use_sim_time", default_value="false"),
+            DeclareLaunchArgument("external_simulator", default_value="false"),
+            DeclareLaunchArgument("external_map", default_value="false"),
+            DeclareLaunchArgument("body_pose_topic", default_value=""),
+            DeclareLaunchArgument("sensor_pose_topic", default_value=""),
+            DeclareLaunchArgument("cloud_topic", default_value=""),
+            DeclareLaunchArgument("depth_topic", default_value=""),
+            DeclareLaunchArgument("cmd_vel_topic", default_value=""),
+            DeclareLaunchArgument("initial_path_topic", default_value="/initial_path"),
+            DeclareLaunchArgument("cloud_is_world", default_value=""),
+            DeclareLaunchArgument("need_extrinsic", default_value=""),
             OpaqueFunction(function=_setup),
         ]
     )

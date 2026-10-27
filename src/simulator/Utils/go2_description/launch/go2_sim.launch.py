@@ -26,7 +26,9 @@ def generate_launch_description():
     description_share = FindPackageShare("go2_description")
     ros_gz_share = FindPackageShare("ros_gz_sim")
     model = PathJoinSubstitution([description_share, "xacro", "robot.xacro"])
-    world = PathJoinSubstitution([description_share, "worlds", "empty.sdf"])
+    world = PathJoinSubstitution(
+        [description_share, "worlds", LaunchConfiguration("world")]
+    )
     bridge_config = PathJoinSubstitution([description_share, "config", "bridge.yaml"])
     robot_description = {
         "robot_description": Command(["xacro ", model, " use_gazebo:=true"]),
@@ -102,6 +104,7 @@ def generate_launch_description():
             DeclareLaunchArgument("x", default_value="0.0"),
             DeclareLaunchArgument("y", default_value="0.0"),
             DeclareLaunchArgument("z", default_value="0.5"),
+            DeclareLaunchArgument("world", default_value="empty.sdf"),
             gazebo,
             state_publisher,
             bridge,

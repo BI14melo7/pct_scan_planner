@@ -1,12 +1,24 @@
 closed_loop_controller:
   ros__parameters:
     use_sim_time: false
-    time_forward: 0.8
-    heading_error_threshold: 0.8
+    # Use a spatially meaningful path chord for body heading. This filters the
+    # short backwards tangent that can appear immediately after a replan.
+    time_forward: 1.0
+    heading_lookahead_distance: 0.45
+    # Keep the body heading for short, moderate-angle detours and use vy as a
+    # real side-step. Rotate in place only for turns larger than about 60 deg.
+    heading_error_threshold: 1.05
+    heading_hold_threshold: 0.18
+    large_turn_confirm_time: 0.35
+    # Keep side-steps short and below about 37 degrees. At larger angles the
+    # body-aligned footprint differs too much from the path-aligned footprint.
+    side_step_distance: 1.2
+    side_step_min_angle: 0.22
+    side_step_max_angle: 0.65
     kp_pos: 0.8
     kp_yaw: 1.5
     max_vx: 0.75
-    max_vy: 0.35
+    max_vy: 0.25
     max_vyaw: 1.0
     finish_dist: 0.15
 
